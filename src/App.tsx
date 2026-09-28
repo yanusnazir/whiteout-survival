@@ -13,6 +13,8 @@ import { ObjectiveCard } from "./components/ObjectiveCard";
 import { Journal } from "./components/Journal";
 import { StartScreen, PauseScreen, GameOverScreen } from "./components/Screens";
 import { EnterShelterButton, InteriorOverlay } from "./components/ShelterView";
+import { StorageModal } from "./components/StorageModal";
+import { DogModal } from "./components/DogModal";
 
 const DEFAULT_STATE: PublicState = {
   health: 100, temp: 62, hunger: 82, thirst: 82, stamina: 100,
@@ -22,6 +24,23 @@ const DEFAULT_STATE: PublicState = {
   journeyIndex: 0, toastId: 0, toastTitle: "", toastMsg: "", toastNext: "",
   fireLighting: -1, resting: false, restProgress: 0, shelterTier: 0, tracking: false, carrying: null,
   equipped: null, running: false, interior: false, campFireFuel: -1,
+  activeStorageId: null,
+  campTotals: {
+    wood: { cur: 0, max: 50 },
+    food: { cur: 0, max: 30 },
+    water: { cur: 0, max: 20 },
+    materials: { cur: 0, max: 40 },
+  },
+  fireplaceFuel: -1,
+  fireplaceHeat: "None",
+  sitting: false,
+  activeDogId: null,
+  dogHunger: 85,
+  dogState: "follow",
+  dogWaiting: false,
+  stormExposure: 0,
+  survivalWarning: "",
+  criticalExposure: false,
 };
 
 interface Toast { id: number; title: string; msg: string; next: string; }
@@ -149,12 +168,27 @@ export default function App() {
       const p = phaseRef.current;
       if (p === "playing") {
         if (k === "q" && !e.repeat) game.cycleTool();
-        if (k === "f" && !e.repeat) game.setInteriorHold(true);
+        if (k === "f" && !e.repeat) {
+          if (game.interiorActive()) {
+            game.addFireplaceWood();
+          } else if (game.hasShelter()) {
+            game.setInteriorHold(true);
+          }
+        }
         if ((k === "e" || k === " ") && !e.repeat) { e.preventDefault(); game.primaryAction(); }
         if (k === "c") { setShowJournal(false); setShowCraft((v) => !v); }
         if (k === "j" || k === "tab") { e.preventDefault(); setShowCraft(false); setShowJournal((v) => !v); }
         if (k === "r") game.rest();
+        if ((k === "x" || k === "z") && !e.repeat) game.toggleSit();
         if (k === "escape") {
+          if (game.activeStorageId) {
+            game.closeStorage();
+            return;
+          }
+          if (game.interiorActive()) {
+            game.setInteriorHold(false);
+            return;
+          }
           setShowCraft((c) => { if (c) return false; return c; });
           setShowJournal((j) => { if (j) return false; return j; });
           setPhaseBoth("paused");
@@ -175,7 +209,6 @@ export default function App() {
       if (k === "a" || k === "arrowleft") game.input.left = false;
       if (k === "d" || k === "arrowright") game.input.right = false;
       if (k === "shift") game.input.run = false;
-      if (k === "f") game.setInteriorHold(false);
       if (k === "e" || k === " ") game.releaseAction();
     };
     const blur = () => { game.input.up = game.input.down = game.input.left = game.input.right = game.input.run = false; game.setInteriorHold(false); game.releaseAction(); };
@@ -201,6 +234,7 @@ export default function App() {
             paused={phase === "paused"}
             onJournal={() => { setShowCraft(false); setShowJournal((v) => !v); }}
             onCraft={() => { setShowJournal(false); setShowCraft((v) => !v); }}
+            onSit={() => game.toggleSit()}
             onRest={() => game.rest()}
             onPause={() => setPhaseBoth(phase === "paused" ? "playing" : "paused")}
           />
@@ -210,6 +244,21 @@ export default function App() {
             <div className="pointer-events-none absolute bottom-[4.5rem] left-1/2 -translate-x-1/2 z-10">
               <div className="bg-emerald-500/90 text-white text-xs sm:text-sm font-bold px-3.5 py-1.5 rounded-full ring-1 ring-emerald-200/40 shadow-lg whitespace-nowrap">
                 {state.actionHint} <span className="opacity-70 hidden sm:inline">· E</span>
+              </div>
+            </div>
+          )}
+
+          {state.survivalWarning && phase === "playing" && (
+            <div className="pointer-events-none absolute top-4 left-1/2 -translate-x-1/2 z-20 max-w-[92vw] sm:max-w-lg">
+              <div className={`backdrop-blur-md px-4 py-2.5 rounded-xl ring-1 shadow-2xl text-center text-xs sm:text-sm font-bold flex items-center gap-2 justify-center anim-pulse ${
+                state.criticalExposure
+                  ? "bg-red-950/90 text-red-100 ring-red-400/80 border border-red-500/50"
+                  : state.storm > 0.3
+                  ? "bg-sky-950/90 text-sky-100 ring-sky-400/60 border border-sky-400/30"
+                  : "bg-amber-950/90 text-amber-100 ring-amber-400/60 border border-amber-400/30"
+              }`}>
+                <span className="text-base">{state.criticalExposure ? "⚠️" : state.storm > 0.3 ? "🌨️" : "ℹ️"}</span>
+                <span>{state.survivalWarning}</span>
               </div>
             </div>
           )}
@@ -251,6 +300,26 @@ export default function App() {
 
           {showCraft && <CraftPanel game={game} s={state} onClose={() => setShowCraft(false)} />}
           {showJournal && <Journal game={game} index={state.journeyIndex} onClose={() => setShowJournal(false)} />}
+          {state.activeStorageId && (
+            (() => {
+              const stEntity = game.entities.find((e) => e.id === state.activeStorageId && !e.dead);
+              return stEntity ? (
+                <StorageModal
+                  game={game}
+                  storageEntity={stEntity}
+                  s={state}
+                  onClose={() => game.closeStorage()}
+                />
+              ) : null;
+            })()
+          )}
+          {state.activeDogId && (
+            <DogModal
+              game={game}
+              s={state}
+              onClose={() => game.closeDog()}
+            />
+          )}
         </>
       )}
 

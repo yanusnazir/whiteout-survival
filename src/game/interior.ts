@@ -308,14 +308,168 @@ export function renderInterior(g: Game, shelter: Entity) {
     ctx.beginPath(); ctx.ellipse(W * 0.66, H * 0.94, W * 0.16, H * 0.05, 0.05, 0, Math.PI * 2); ctx.fill();
   }
 
-  // small personal things: firewood stacked inside by the wall
+  // small personal things: firewood stacked inside by the wall (in lean-to and walled shelter)
   const woodN = Math.min(6, g.inventory.wood || 0);
-  for (let i = 0; i < woodN; i++) {
-    const x = W * 0.86 + (i % 3) * 16 * S, y = H * 0.83 - Math.floor(i / 3) * 12 * S;
-    ctx.fillStyle = rgb(mix([40, 28, 18], [120, 86, 54], lit));
-    ctx.beginPath(); ctx.ellipse(x, y, 8 * S, 6 * S, 0, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = rgb(mix([60, 48, 34], [196, 162, 118], lit));
-    ctx.beginPath(); ctx.ellipse(x, y, 4 * S, 3 * S, 0, 0, Math.PI * 2); ctx.fill();
+  if (tier < 3) {
+    for (let i = 0; i < woodN; i++) {
+      const x = W * 0.86 + (i % 3) * 16 * S, y = H * 0.83 - Math.floor(i / 3) * 12 * S;
+      ctx.fillStyle = rgb(mix([40, 28, 18], [120, 86, 54], lit));
+      ctx.beginPath(); ctx.ellipse(x, y, 8 * S, 6 * S, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = rgb(mix([60, 48, 34], [196, 162, 118], lit));
+      ctx.beginPath(); ctx.ellipse(x, y, 4 * S, 3 * S, 0, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  // ================= TIER 3: REAL STONE FIREPLACE & CHIMNEY =================
+  const fpHutFuel = shelter.fireplaceFuel !== undefined ? shelter.fireplaceFuel : 80;
+  const fpBurning = tier >= 3 && fpHutFuel > 0;
+  const fpIntensity = Math.min(1, fpHutFuel / 40 + 0.3);
+  const fpL = fpIntensity * flick;
+  const fpx = W * 0.84, fpy = floorY + 14 * S;
+
+  if (tier === 3) {
+    // 1. Stone Chimney Flue rising all the way up through the rafters and ceiling
+    const chimW = 54 * S;
+    const flueGrad = ctx.createLinearGradient(fpx - chimW / 2, 0, fpx + chimW / 2, 0);
+    flueGrad.addColorStop(0, rgb(mix([35, 33, 36], [85, 82, 86], lit)));
+    flueGrad.addColorStop(0.5, rgb(mix([50, 48, 52], [115, 112, 118], lit)));
+    flueGrad.addColorStop(1, rgb(mix([30, 28, 32], [75, 72, 76], lit)));
+    ctx.fillStyle = flueGrad;
+    ctx.fillRect(fpx - chimW * 0.45, 0, chimW * 0.9, fpy - 60 * S);
+
+    // Stone masonry lines on the chimney flue
+    ctx.strokeStyle = rgb(mix([20, 18, 20], [60, 58, 62], lit), 0.7);
+    ctx.lineWidth = 1.8 * S;
+    for (let cy = 10 * S; cy < fpy - 60 * S; cy += 16 * S) {
+      ctx.beginPath();
+      ctx.moveTo(fpx - chimW * 0.44, cy);
+      ctx.lineTo(fpx + chimW * 0.44, cy);
+      ctx.stroke();
+    }
+
+    // 2. Heavy Carved Timber Mantelpiece Beam
+    const mantelY = fpy - 64 * S;
+    const mantelW = 76 * S;
+    const mantelH = 14 * S;
+    ctx.fillStyle = rgb(mix([44, 30, 18], [130, 94, 60], lit + fpL * 0.25));
+    ctx.beginPath();
+    ctx.roundRect(fpx - mantelW / 2, mantelY, mantelW, mantelH, 3 * S);
+    ctx.fill();
+    ctx.strokeStyle = rgb(mix([25, 18, 10], [80, 56, 34], lit), 0.8);
+    ctx.lineWidth = 1.5 * S;
+    ctx.stroke();
+
+    // 3. Fieldstone Hearth and Firebox Surround
+    const boxW = 68 * S, boxH = 68 * S;
+    const hearthStoneC = rgb(mix([40, 38, 42], [105, 102, 108], lit + fpL * 0.15));
+    ctx.fillStyle = hearthStoneC;
+    ctx.beginPath();
+    ctx.roundRect(fpx - boxW / 2, fpy - 50 * S, boxW, boxH, 6 * S);
+    ctx.fill();
+
+    // Fieldstone masonry pattern around the firebox
+    for (let row = 0; row < 4; row++) {
+      const ry = fpy - 48 * S + row * 16 * S;
+      for (let col = 0; col < 3; col++) {
+        const rx = fpx - boxW / 2 + 6 * S + col * 20 * S;
+        ctx.strokeStyle = "rgba(15,14,16,0.6)";
+        ctx.lineWidth = 2 * S;
+        ctx.strokeRect(rx, ry, 18 * S, 14 * S);
+      }
+    }
+
+    // 4. Firebox Chamber (Interior cavity)
+    const fbW = 46 * S, fbH = 44 * S;
+    ctx.fillStyle = "#120e0c"; // soot-blackened stone cavity
+    ctx.beginPath();
+    ctx.roundRect(fpx - fbW / 2, fpy - 38 * S, fbW, fbH, 4 * S);
+    ctx.fill();
+
+    // 5. Fireplace Hearth Floor Extension (flagstones on the floor)
+    ctx.fillStyle = rgb(mix([32, 30, 34], [88, 85, 90], lit + fpL * 0.2));
+    ctx.beginPath();
+    ctx.ellipse(fpx - 6 * S, fpy + 16 * S, 36 * S, 14 * S, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Birch firewood logs resting on the iron grate
+    const logW = 32 * S;
+    ctx.strokeStyle = fpBurning ? "#3a2414" : "#241e1c";
+    ctx.lineWidth = 7 * S;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(fpx - logW * 0.45, fpy - 2 * S);
+    ctx.lineTo(fpx + logW * 0.45, fpy - 8 * S);
+    ctx.moveTo(fpx - logW * 0.4, fpy - 8 * S);
+    ctx.lineTo(fpx + logW * 0.4, fpy - 2 * S);
+    ctx.stroke();
+
+    if (fpBurning) {
+      // Glowing coals / ember bed
+      const eg = ctx.createRadialGradient(fpx, fpy - 4 * S, 2 * S, fpx, fpy - 4 * S, 22 * S);
+      eg.addColorStop(0, `rgba(255, 120, 20, ${0.9 * fpL})`);
+      eg.addColorStop(0.5, `rgba(255, 60, 10, ${0.7 * fpL})`);
+      eg.addColorStop(1, "rgba(200, 30, 0, 0)");
+      ctx.fillStyle = eg;
+      ctx.beginPath();
+      ctx.ellipse(fpx, fpy - 5 * S, 20 * S, 8 * S, 0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Living fireplace flames dancing inside the hearth
+      const flameCols = ["#e03a08", "#ff7a12", "#ffb236", "#ffe98a"];
+      for (let i = 0; i < 4; i++) {
+        const flameWob = Math.sin(tSec * (8 + i * 2.8) + i * 1.5) * 0.22 + 0.85;
+        const flH = (38 - i * 8) * S * flameWob * fpIntensity;
+        const flW = (16 - i * 3.2) * S;
+        const flameSway = Math.sin(tSec * 4 + i) * 2.5 * S;
+        ctx.fillStyle = flameCols[i];
+        ctx.beginPath();
+        ctx.moveTo(fpx + flameSway, fpy - 8 * S - flH);
+        ctx.quadraticCurveTo(fpx + flW, fpy - 8 * S - flH * 0.35, fpx + flW * 0.6, fpy - 4 * S);
+        ctx.lineTo(fpx - flW * 0.6, fpy - 4 * S);
+        ctx.quadraticCurveTo(fpx - flW, fpy - 8 * S - flH * 0.35, fpx + flameSway, fpy - 8 * S - flH);
+        ctx.fill();
+      }
+
+      // Wisps of warm smoke & embers rising into the chimney flue
+      for (let i = 0; i < 5; i++) {
+        const p = (tSec * 0.4 + i / 5) % 1;
+        const smX = fpx + Math.sin(tSec * 2.5 + i * 1.8) * (6 * S);
+        const smY = fpy - 24 * S - p * (50 * S);
+        // glowing spark
+        ctx.fillStyle = `rgba(255, 180, 70, ${(1 - p) * 0.85 * fpIntensity})`;
+        ctx.fillRect(smX, smY, 2 * S, 2 * S);
+        // translucent smoke puff drifting up the flue
+        ctx.fillStyle = `rgba(160, 160, 170, ${(1 - p) * 0.16 * fpIntensity})`;
+        ctx.beginPath();
+        ctx.arc(smX, smY - 6 * S, (4 + p * 8) * S, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    } else {
+      // Cold fireplace ash
+      ctx.fillStyle = "rgba(180, 185, 195, 0.4)";
+      ctx.beginPath();
+      ctx.ellipse(fpx, fpy - 4 * S, 16 * S, 5 * S, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Firewood stacked neatly beside the fireplace
+    const woodCount = Math.min(8, g.inventory.wood || 0);
+    for (let i = 0; i < woodCount; i++) {
+      const wx = fpx - 44 * S + (i % 2) * 14 * S, wy = fpy + 10 * S - Math.floor(i / 2) * 10 * S;
+      ctx.fillStyle = rgb(mix([38, 26, 16], [116, 82, 50], lit + fpL * 0.2));
+      ctx.beginPath(); ctx.ellipse(wx, wy, 7 * S, 5 * S, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = rgb(mix([55, 44, 30], [185, 155, 110], lit + fpL * 0.2));
+      ctx.beginPath(); ctx.ellipse(wx, wy, 3.5 * S, 2.5 * S, 0, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // Cozy fur hearth rug in front of the fireplace for sitting
+    ctx.fillStyle = rgb(mix([48, 38, 28], [150, 126, 96], lit + fpL * 0.3), 0.95);
+    ctx.beginPath();
+    ctx.ellipse(W * 0.68, H * 0.93, 44 * S, 18 * S, 0.08, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(100, 75, 48, 0.5)";
+    ctx.lineWidth = 1.5 * S;
+    ctx.stroke();
   }
 
   // ---- the survivor ----
@@ -331,7 +485,7 @@ export function renderInterior(g: Game, shelter: Entity) {
     g.pfacing = 1;
     drawPlayer(g, g.px, g.py);
     ctx.restore();
-    ctx.fillStyle = rgb(mix([40, 28, 18], [122, 88, 56], lit + fireL * 0.15));
+    ctx.fillStyle = rgb(mix([40, 28, 18], [122, 88, 56], lit + fireL * 0.15 + fpL * 0.15));
     ctx.beginPath();
     ctx.moveTo(bedX + bedW * 0.9, bedY - 8 * S);
     ctx.quadraticCurveTo(bedX + bedW * 0.6, bedY - 30 * S - breath * 200 * S, bedX + bedW * 0.28, bedY - 14 * S);
@@ -345,10 +499,26 @@ export function renderInterior(g: Game, shelter: Entity) {
       ctx.fillStyle = `rgba(220,230,255,${Math.sin(p * Math.PI) * 0.4})`;
       ctx.fillText("z", bedX + bedW * 0.2 + p * 30 * S, bedY - 50 * S - p * 60 * S);
     }
-  } else {
-    // standing inside, looking out toward the fire
+  } else if (g.sitting && tier === 3) {
+    // Visibly sitting on the hearth rug right beside the fireplace!
     ctx.save();
-    ctx.translate(W * 0.7, H * 0.985);
+    ctx.translate(W * 0.68, H * 0.93);
+    ctx.scale(k * 0.96, k * 0.96);
+    g.pfacing = 1;
+    drawPlayer(g, g.px, g.py);
+    ctx.restore();
+  } else if (g.sitting) {
+    // Sitting beside shelter entrance / campfire
+    ctx.save();
+    ctx.translate(W * 0.62, H * 0.94);
+    ctx.scale(k * 0.96, k * 0.96);
+    g.pfacing = 1;
+    drawPlayer(g, g.px, g.py);
+    ctx.restore();
+  } else {
+    // standing inside, looking out toward the fire / room
+    ctx.save();
+    ctx.translate(tier === 3 ? W * 0.64 : W * 0.7, H * 0.985);
     ctx.scale(k, k);
     g.pfacing = -1;
     drawPlayer(g, g.px, g.py);
@@ -368,7 +538,8 @@ export function renderInterior(g: Game, shelter: Entity) {
   cold.addColorStop(1, "rgba(80,110,170,0)");
   ctx.fillStyle = cold;
   ctx.fillRect(0, 0, W, H);
-  // warm firelight entering through the doorway and washing across the floor & walls
+
+  // Warm firelight entering from outside campfire through doorway
   if (burning) {
     const strength = fireL * (0.55 + night * 0.45);
     const wg = ctx.createRadialGradient(fx, fy, 0, fx, fy, H * (tier === 1 ? 1.1 : 0.95));
@@ -387,6 +558,27 @@ export function renderInterior(g: Game, shelter: Entity) {
     ctx.moveTo(opX0, floorY); ctx.lineTo(opX1, floorY);
     ctx.lineTo(opX1 + spread, H); ctx.lineTo(opX0 - spread, H);
     ctx.closePath(); ctx.fill();
+  }
+
+  // WARM FIREPLACE LIGHT FLOODING THE WOODEN HUT INTERIOR
+  if (fpBurning) {
+    const strength = fpL * (0.65 + night * 0.45);
+    // Rich warm radial firelight centered on the fireplace hearth
+    const fpg = ctx.createRadialGradient(fpx, fpy - 10 * S, 4 * S, fpx, fpy - 10 * S, H * 0.95);
+    fpg.addColorStop(0, `rgba(255, 155, 60, ${0.48 * strength})`);
+    fpg.addColorStop(0.3, `rgba(255, 120, 40, ${0.22 * strength})`);
+    fpg.addColorStop(0.65, `rgba(255, 95, 25, ${0.08 * strength})`);
+    fpg.addColorStop(1, "rgba(255, 75, 15, 0)");
+    ctx.fillStyle = fpg;
+    ctx.fillRect(0, 0, W, H);
+
+    // Light pool across the floor and hearth rug
+    const ffl = ctx.createRadialGradient(W * 0.72, H * 0.90, 4 * S, W * 0.72, H * 0.90, W * 0.35);
+    ffl.addColorStop(0, `rgba(255, 160, 65, ${0.30 * strength})`);
+    ffl.addColorStop(0.6, `rgba(255, 115, 35, ${0.10 * strength})`);
+    ffl.addColorStop(1, "rgba(255, 80, 20, 0)");
+    ctx.fillStyle = ffl;
+    ctx.fillRect(bx0, floorY, bx1 - bx0 + W * 0.2, H - floorY);
   }
   ctx.restore();
   ctx.restore(); // end inside clip

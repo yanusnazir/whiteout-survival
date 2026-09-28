@@ -71,11 +71,11 @@ export const SHELTER_COST: Partial<Record<ItemId, number>> = { wood: 12, branch:
 export const FIRE_COST: Partial<Record<ItemId, number>> = { wood: 6, branch: 4, stone: 4 };
 // The SAME shelter is improved in stages (index = current tier).
 export const SHELTER_UPGRADES: Record<number, { name: string; cost: Partial<Record<ItemId, number>>; done: string }> = {
-  1: { name: "Log walls", cost: { wood: 8, branch: 6, stone: 6 }, done: "Log walls packed with snow. The wind can't reach you." },
-  2: { name: "Hide roof & insulation", cost: { hide: 2, wood: 4, fiber: 4, branch: 4 }, done: "Hide-lined roof and a proper doorway. A small winter hut." },
+  1: { name: "Small wooden shelter", cost: { wood: 8, branch: 6, stone: 6 }, done: "Solid log walls chinked with snow. The wind can't reach you." },
+  2: { name: "Proper wooden hut & fireplace", cost: { hide: 2, wood: 4, fiber: 4, branch: 4 }, done: "Heavy timber walls, stone chimney, and a real fireplace inside. A warm wooden hut." },
 };
-export const SHELTER_NAMES: Record<number, string> = { 1: "Lean-to", 2: "Walled shelter", 3: "Winter hut" };
-export const SHELTER_WARMTH: Record<number, number> = { 0: 0, 1: 7, 2: 13, 3: 20 };
+export const SHELTER_NAMES: Record<number, string> = { 1: "Lean-to", 2: "Small wooden shelter", 3: "Proper wooden hut" };
+export const SHELTER_WARMTH: Record<number, number> = { 0: 0, 1: 7, 2: 14, 3: 24 };
 
 export const CLOTHING_WARMTH: Partial<Record<ItemId, number>> = {
   furWrap: 7,
@@ -85,3 +85,26 @@ export const CLOTHING_WARMTH: Partial<Record<ItemId, number>> = {
   gloves: 3,
   warmCoat: 20,
 };
+
+// Camp storage capacities and allowed item categories
+export const WOOD_STORAGE_CAPACITY = 50;
+export const FOOD_STORAGE_CAPACITY = 30;
+export const WATER_STORAGE_CAPACITY = 20;
+export const MATERIAL_STORAGE_CAPACITY = 60;
+
+export const FOOD_STORAGE_ITEMS: ItemId[] = ["meat", "cookedMeat", "driedMeat", "fish", "cookedFish"];
+export const WATER_STORAGE_ITEMS: ItemId[] = ["water", "streamWater"];
+export const MATERIAL_STORAGE_ITEMS: ItemId[] = [
+  "stone",
+  "branch",
+  "fiber",
+  "tinder",
+  "bone",
+  "hide",
+  "curedHide",
+  "sinew",
+  "sharpStone",
+  "shaft",
+  "snow",
+];
+

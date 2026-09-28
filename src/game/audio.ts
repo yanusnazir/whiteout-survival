@@ -325,25 +325,29 @@ export class AudioEngine {
     const prox = p.fireProx;
     // from inside the shelter the fire is soft and a little distant
     const insideMul = inside === 0 ? 1 : inside === 1 ? 0.62 : 0.4;
-    const vol = Math.pow(prox, 1.7) * (0.55 + p.fireIntensity * 0.45) * insideMul;
+    // during a storm, the warmth of the fire is intensified and crackles are prominent
+    const stormFireBoost = p.storm > 0.3 && prox > 0.1 ? 1.25 : 1.0;
+    const vol = Math.pow(prox, 1.6) * (0.55 + p.fireIntensity * 0.45) * insideMul * stormFireBoost;
     const fireCut = inside === 0 ? 20000 : inside === 1 ? 1700 : 1100;
     if (Math.abs(prox - this.lastFireProx) > 0.002 || prox === 0 || inside !== 0) {
       this.fireBus.gain.setTargetAtTime(vol, now, 0.2);
       this.fireFilter.frequency.setTargetAtTime(Math.min(fireCut, 700 + prox * prox * 7500), now, 0.25);
       this.firePanner.pan.setTargetAtTime(p.firePan * (1 - prox * 0.6), now, 0.15);
-      this.fireBed.gain.setTargetAtTime(0.1 * p.fireIntensity, now, 0.5);
-      this.fireHiss.gain.setTargetAtTime(0.006 * p.fireIntensity, now, 0.5);
+      this.fireBed.gain.setTargetAtTime(0.12 * p.fireIntensity * stormFireBoost, now, 0.5);
+      this.fireHiss.gain.setTargetAtTime(0.008 * p.fireIntensity * stormFireBoost, now, 0.5);
       this.lastFireProx = prox;
     }
     if (vol > 0.004) {
-      // irregular clusters of tiny crackles, rare pops
-      const rate = (3 + p.fireIntensity * 9) * (0.6 + Math.random() * 0.8);
+      // irregular clusters of tiny crackles, pops prominent during storm
+      const stormCrackleRate = p.storm > 0.3 ? 1.6 : 1.0;
+      const rate = (3 + p.fireIntensity * 10) * (0.6 + Math.random() * 0.8) * stormCrackleRate;
       this.crackleAcc += p.dt * rate;
       while (this.crackleAcc >= 1) {
         this.crackleAcc -= 1;
-        if (Math.random() < 0.8) this.crackle(false);
+        if (Math.random() < 0.82) this.crackle(false);
       }
-      if (Math.random() < p.dt * 0.25 * p.fireIntensity) this.crackle(true);
+      const popChance = (0.25 + (p.storm > 0.3 ? 0.35 : 0)) * p.fireIntensity;
+      if (Math.random() < p.dt * popChance) this.crackle(true);
     } else this.crackleAcc = 0;
 
     // --- rare distant events (long silences in between) ---
@@ -545,8 +549,29 @@ export class AudioEngine {
     this.tone(260, 0.08, 0.1, "sine", 190, 0.12);
     this.noiseHit({ dur: 0.18, vol: 0.04, type: "bandpass", freq: 1200 });
   }
-  eat() { this.noiseHit({ dur: 0.12, vol: 0.07, type: "lowpass", freq: 900 }); this.noiseHit({ dur: 0.12, vol: 0.05, type: "lowpass", freq: 800 }); }
-  drink() { this.tone(380, 0.18, 0.05, "sine", 260); this.tone(330, 0.16, 0.04, "sine", 240, 0.18); }
+  eat() { this.eatBite(); }
+  eatBite() {
+    this.noiseHit({ dur: 0.09, vol: 0.06, type: "bandpass", freq: 1100, q: 2.5, attack: 0.008 });
+    this.noiseHit({ dur: 0.14, vol: 0.04, type: "lowpass", freq: 700, attack: 0.02, buf: this.pink });
+  }
+  eatChew() {
+    this.noiseHit({ dur: 0.11, vol: 0.035, type: "bandpass", freq: 850, q: 3.0, attack: 0.02 });
+  }
+  drink() { this.drinkSip(); }
+  drinkSip() {
+    this.tone(390, 0.14, 0.03, "sine", 270);
+    this.noiseHit({ dur: 0.12, vol: 0.025, type: "bandpass", freq: 1400, q: 2.0, attack: 0.02 });
+  }
+  drinkSwallow() {
+    this.tone(240, 0.16, 0.035, "sine", 180);
+  }
+  rustleCloth() {
+    this.noiseHit({ dur: 0.22, vol: 0.03, type: "bandpass", freq: 950, q: 1.5, attack: 0.04, buf: this.pink });
+  }
+  dogEatCrunch() {
+    this.noiseHit({ dur: 0.08, vol: 0.05, type: "bandpass", freq: 1200, q: 2.0, attack: 0.01 });
+    this.noiseHit({ dur: 0.12, vol: 0.03, type: "lowpass", freq: 650, attack: 0.02 });
+  }
   hurt() { this.tone(140, 0.18, 0.08, "triangle", 90); }
   hunt() { this.noiseHit({ dur: 0.12, vol: 0.14, type: "lowpass", freq: 700 }); this.tone(110, 0.15, 0.12, "sine", 60); }
   throwWhoosh() {
@@ -570,6 +595,37 @@ export class AudioEngine {
     s.connect(f).connect(g).connect(this.sfx); s.start(t, Math.random() * 4); s.stop(t + 1.5);
   }
   fishBite() { this.noiseHit({ dur: 0.2, vol: 0.08, type: "bandpass", freq: 1400 }); this.tone(900, 0.06, 0.03); }
+  dogBark() {
+    this.tone(220, 0.12, 0.09, "triangle", 160);
+    this.noiseHit({ dur: 0.1, vol: 0.08, type: "bandpass", freq: 750, q: 2.2 });
+  }
+  dogPant() {
+    this.noiseHit({ dur: 0.08, vol: 0.03, type: "bandpass", freq: 1200, attack: 0.02 });
+  }
+  dogHappy() {
+    this.tone(360, 0.14, 0.05, "sine", 420);
+    this.tone(430, 0.12, 0.04, "sine", 380, 0.1);
+  }
+  cough() {
+    if (!this.ctx || this.muted) return;
+    this.noiseHit({ dur: 0.14, vol: 0.11, type: "bandpass", freq: 720, q: 2.2, attack: 0.015, buf: this.pink });
+    this.tone(180, 0.11, 0.07, "triangle", 110);
+    setTimeout(() => {
+      if (!this.ctx || this.muted) return;
+      this.noiseHit({ dur: 0.16, vol: 0.08, type: "bandpass", freq: 650, q: 2.0, attack: 0.02, buf: this.pink });
+      this.tone(145, 0.13, 0.05, "triangle", 90);
+    }, 130);
+  }
+  gasp() {
+    if (!this.ctx || this.muted) return;
+    this.noiseHit({ dur: 0.32, vol: 0.1, type: "bandpass", freq: 1100, q: 1.8, attack: 0.06, buf: this.pink });
+    this.tone(260, 0.26, 0.035, "sine", 190);
+  }
+  strainedBreath() {
+    if (!this.ctx || this.muted) return;
+    this.noiseHit({ dur: 0.45, vol: 0.07, type: "bandpass", freq: 850, q: 2.0, attack: 0.1, buf: this.pink });
+    this.tone(125, 0.35, 0.03, "sine", 95);
+  }
   wolf() { if (this.ctx) this.distantHowl(0.012); }
   gameOver() { this.tone(196, 1.8, 0.07, "sine", 130); }
   levelUp() { this.tone(523, 0.9, 0.035); this.tone(784, 1.2, 0.025, "sine", undefined, 0.25); }

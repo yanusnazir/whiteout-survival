@@ -1,5 +1,9 @@
 import { audio } from "./audio";
-import { CLOTHING_WARMTH, DRY_DAYS, FIRE_COST, ITEMS, POT_CAPACITY, RACK_COST, RACK_SLOTS, RECIPES, SHELF_LIFE, SHELTER_COST, SHELTER_NAMES, SHELTER_UPGRADES, SHELTER_WARMTH, WORLD_SIZE } from "./data";
+import {
+  CLOTHING_WARMTH, DRY_DAYS, FIRE_COST, ITEMS, POT_CAPACITY, RACK_COST, RACK_SLOTS, RECIPES,
+  SHELF_LIFE, SHELTER_COST, SHELTER_NAMES, SHELTER_UPGRADES, SHELTER_WARMTH, WORLD_SIZE,
+  WOOD_STORAGE_CAPACITY, FOOD_STORAGE_CAPACITY, WATER_STORAGE_CAPACITY, MATERIAL_STORAGE_CAPACITY,
+} from "./data";
 import { JOURNEY, type GuideTarget } from "./journey";
 import type { Entity, EntityKind, ItemId, Recipe } from "./types";
 
@@ -9,6 +13,14 @@ export interface Particle {
 }
 export interface Floater { x: number; y: number; text: string; life: number; color: string; vy: number; }
 export interface Projectile { x: number; y: number; vx: number; vy: number; dist: number; max: number; angle: number; }
+export interface Footprint { x: number; y: number; angle: number; side: number; life: number; maxLife: number; }
+
+export interface CampTotals {
+  wood: { cur: number; max: number };
+  food: { cur: number; max: number };
+  water: { cur: number; max: number };
+  materials: { cur: number; max: number };
+}
 
 export interface PublicState {
   health: number; temp: number; hunger: number; thirst: number; stamina: number;
@@ -22,6 +34,18 @@ export interface PublicState {
   tracking: boolean; carrying: string | null;
   equipped: ItemId | null; running: boolean;
   interior: boolean; campFireFuel: number; // -1 = no fire pit near the shelter
+  activeStorageId: number | null;
+  campTotals: CampTotals;
+  fireplaceFuel: number; // -1 if no tier 3 wooden hut, or 0..100
+  fireplaceHeat: "Strong" | "Moderate" | "Low" | "Out" | "None";
+  sitting: boolean;
+  activeDogId: number | null;
+  dogHunger: number;
+  dogState: string;
+  dogWaiting: boolean;
+  stormExposure: number;
+  survivalWarning: string;
+  criticalExposure: boolean;
 }
 
 export interface SaveData {
@@ -48,10 +72,20 @@ function mulberry32(a: number): Rng {
 
 const DAY_LENGTH = 420; // seconds per full day
 const ANIMALS = ["rabbit", "deer", "wolf"];
-const STATIC_OBSTACLES = ["tree", "smallTree", "deadTree", "rock", "bush", "looseBranch", "looseStone", "snowPile", "stump"];
+const STATIC_OBSTACLES = [
+  "tree", "smallTree", "deadTree", "rock", "bush", "looseBranch",
+  "looseStone", "snowPile", "stump", "woodStorage", "foodStorage",
+  "waterStorage", "materialStorage"
+];
 
 export class Game {
-  static INTERACTABLE: EntityKind[] = ["tree", "smallTree", "deadTree", "rock", "looseBranch", "looseStone", "bush", "snowPile", "waterHole", "rabbit", "deer", "wolf", "trap", "firePit", "fire", "shelter", "buildSite", "carcass", "spearOnGround", "dryingRack"];
+  static INTERACTABLE: EntityKind[] = [
+    "tree", "smallTree", "deadTree", "rock", "looseBranch", "looseStone",
+    "bush", "snowPile", "waterHole", "rabbit", "deer", "wolf", "trap",
+    "firePit", "fire", "shelter", "buildSite", "carcass", "spearOnGround",
+    "dryingRack", "woodStorage", "foodStorage", "waterStorage", "materialStorage",
+    "dog"
+  ];
 
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
@@ -63,10 +97,21 @@ export class Game {
   floaters: Floater[] = [];
   projectiles: Projectile[] = [];
   nextId = 1;
+  activeDogId: number | null = null;
 
   px = WORLD_SIZE / 2; py = WORLD_SIZE / 2;
   pfacing = 1; pmoving = false; panim = 0; pact = 0;
-  aimX = 1; aimY = 0;
+  sitting = false; // sitting down beside the fire/hearth
+  sitTransition = 0; // 0..1 smooth blend between standing and sitting
+  consuming: { item: ItemId; isDrink: boolean; timer: number; total: number; stage: number } | null = null;
+  pAngle = Math.PI / 2; // facing forward/south towards camera initially
+  pWalkBlend = 0;       // 0..1 smooth blend between idle and walking
+  footSide = 1;         // alternating left (-1) / right (1) foot
+  pIdleAnim = 0;        // continuous idle breathing & subtle life timer
+  lastStepIndex = 0;    // synchronized step plant tracking
+  pMoveAngle = Math.PI / 2; // movement travel angle
+  playerPrints: Footprint[] = [];
+  aimX = 0; aimY = 1;
   camX = 0; camY = 0; shake = 0; hurtFlash = 0;
 
   input = { up: false, down: false, left: false, right: false, run: false };
@@ -84,6 +129,16 @@ export class Game {
   time = 0.26; day = 1; score = 0; alive = true; paused = false; running = true;
   weather: "clear" | "snow" | "storm" = "clear";
   weatherTimer = 60; storm = 0;
+  stormPhase: "none" | "approaching" | "blizzard" = "none";
+  stormApproachTimer = 0;
+  stormExposure = 0; // 0..1 exposure outside in active snowstorm
+  criticalColdTimer = 60; // 60s grace timer for prolonged critical exposure before collapse
+  exposureSoundTimer = 0;
+  survivalWarning = "";
+
+  isStormActive(): boolean {
+    return this.weather === "storm" && this.storm > 0.35;
+  }
 
   message = ""; messageTimer = 0;
   footTimer = 0;
@@ -113,6 +168,8 @@ export class Game {
   eInterior = false;                    // ACT held long enough on the shelter
   wakeLinger = 0;                       // stay inside briefly after waking naturally
 
+  activeStorageId: number | null = null; // currently opened storage container
+
   onUpdate?: (s: PublicState) => void;
   onGameOver?: () => void;
 
@@ -135,9 +192,14 @@ export class Game {
     this.seed = seed >>> 0;
     this.rng = mulberry32(this.seed);
     this.equipped = null; this.fuelAdded = 0; this.saveTimer = 0; this.prunning = false;
+    this.activeStorageId = null;
     this.entities = []; this.particles = []; this.floaters = []; this.projectiles = [];
     this.nextId = 1;
     this.px = WORLD_SIZE / 2; this.py = WORLD_SIZE / 2;
+    this.pfacing = 1; this.pAngle = Math.PI / 2; this.pWalkBlend = 0; this.footSide = 1;
+    this.sitting = false;
+    this.pIdleAnim = 0; this.lastStepIndex = 0; this.pMoveAngle = Math.PI / 2;
+    this.playerPrints = []; this.aimX = 0; this.aimY = 1;
     this.camX = this.px - this.w / 2; this.camY = this.py - this.h / 2;
     this.health = 100; this.temp = 62; this.hunger = 82; this.thirst = 82; this.stamina = 100;
     this.inventory = {} as any;
@@ -193,6 +255,24 @@ export class Game {
     ring("bush", 4, 240);
     ring("snowPile", 3, 160);
     this.entities.push({ id: this.nextId++, kind: "waterHole", x: this.px - 380, y: this.py + 240 });
+    this.ensureDog();
+  }
+
+  ensureDog() {
+    if (!this.entities.some((e) => e.kind === "dog" && !e.dead)) {
+      this.entities.push({
+        id: this.nextId++,
+        kind: "dog",
+        x: this.px + 28,
+        y: this.py + 18,
+        dogHunger: 85,
+        dogState: "follow",
+        dogStateTimer: 0,
+        dogTailWag: 0,
+        dogAnim: 0,
+        scale: 0.95,
+      });
+    }
   }
 
   spawnAnimal(kind: "rabbit" | "deer" | "wolf") {
@@ -248,8 +328,28 @@ export class Game {
       if (spoiled) {
         this.inventory[item] = Math.max(0, have - spoiled);
         if (!this.inventory[item]) delete this.inventory[item];
-        this.msg(`${spoiled} ${ITEMS[item].name.toLowerCase()} spoiled. Dry extra meat on a rack to preserve it.`, 5);
+        this.msg(`${spoiled} ${ITEMS[item].name.toLowerCase()} spoiled in pack. Dry extra meat on a rack to preserve it.`, 5);
         this.floater(this.px, this.py - 50, `${ITEMS[item].icon} spoiled`, "#a3a38a");
+      }
+    }
+    // Also update food in foodStorage (elevated sub-zero cache extends freshness by 50%)
+    for (const e of this.entities) {
+      if (e.kind !== "foodStorage" || !e.storage || !e.foodTimestamps) continue;
+      for (const k in e.foodTimestamps) {
+        const item = k as ItemId;
+        const life = (SHELF_LIFE[item] || 0) * 1.5;
+        const b = e.foodTimestamps[item];
+        if (!life || !b || !b.length) continue;
+        const count = e.storage[item] || 0;
+        while (b.length > count) b.shift();
+        while (b.length < count) b.push(now);
+        let spoiled = 0;
+        while (b.length && now - b[0] > life) { b.shift(); spoiled++; }
+        if (spoiled) {
+          e.storage[item] = Math.max(0, count - spoiled);
+          if (!e.storage[item]) delete e.storage[item];
+          this.floater(e.x, e.y - 45, `${ITEMS[item].icon} spoiled in cache`, "#a3a38a");
+        }
       }
     }
   }
@@ -366,6 +466,140 @@ export class Game {
     }
     return h;
   }
+  hutShelter(): Entity | null {
+    return this.entities.find((e) => e.kind === "shelter" && (e.tier || 1) >= 3 && !e.dead) || null;
+  }
+
+  // radiant heat from the wooden hut's fireplace
+  fireplaceHeat(): number {
+    const hut = this.hutShelter();
+    if (!hut || (hut.fireplaceFuel || 0) <= 0) return 0;
+    const fuel = hut.fireplaceFuel || 0;
+    const intensity = Math.min(1, fuel / 40 + 0.3);
+    if (this.interiorActive()) {
+      return intensity; // full heat inside the wooden hut
+    }
+    const d = Math.hypot(hut.x - this.px, hut.y - this.py);
+    if (d > 140) return 0; // outside the hut, does not warm the entire map
+    const k = Math.max(0, 1 - d / 140);
+    return Math.pow(k, 1.2) * 0.75 * intensity;
+  }
+
+  fireplaceHeatLevel(sh?: Entity | null): "Strong" | "Moderate" | "Low" | "Out" | "None" {
+    const s = sh || this.hutShelter();
+    if (!s || (s.tier || 1) < 3) return "None";
+    const f = s.fireplaceFuel !== undefined ? s.fireplaceFuel : 0;
+    if (f >= 60) return "Strong";
+    if (f >= 25) return "Moderate";
+    if (f > 0) return "Low";
+    return "Out";
+  }
+
+  addFireplaceWood(targetHut?: Entity | null): boolean {
+    const hut = targetHut || this.hutShelter();
+    if (!hut || (hut.tier || 1) < 3) {
+      this.msg("No wooden hut with a fireplace nearby.");
+      return false;
+    }
+    const item: ItemId | null = this.has("wood") ? "wood" : this.has("branch") ? "branch" : null;
+    if (!item) {
+      this.msg("You need wood or branches to feed the fireplace.");
+      audio.hurt();
+      return false;
+    }
+    const cur = hut.fireplaceFuel || 0;
+    if (cur >= 95) {
+      this.msg("The fireplace is well fueled (10/10 logs). Burning strongly.");
+      return false;
+    }
+    this.remove(item, 1);
+    this.fuelAdded++;
+    const added = item === "wood" ? 20 : 8;
+    hut.fireplaceFuel = Math.min(100, cur + added);
+    audio.chop();
+    this.pact = 0.35;
+    this.burst(hut.x + 20, hut.y - 12, "#ffb14e", 14, "spark", 110);
+    this.floater(hut.x + 20, hut.y - 45, item === "wood" ? "+log in Fireplace 🔥" : "+branch in Fireplace 🔥", "#ffb14e");
+    this.msg(`Fireplace fueled (${Math.ceil(hut.fireplaceFuel / 10)}/10 logs). Heat: ${this.fireplaceHeatLevel(hut)}`, 3);
+    this.emit();
+    return true;
+  }
+
+  toggleSit() {
+    if (this.sitting) {
+      this.standUp();
+      return;
+    }
+    // Check if near shelter, fire, or inside
+    const sh = this.nearest((e) => e.kind === "shelter");
+    const f = this.nearest((e) => e.kind === "fire" || e.kind === "firePit");
+    const nearSh = sh && Math.hypot(sh.x - this.px, sh.y - this.py) < 140;
+    const nearF = f && Math.hypot(f.x - this.px, f.y - this.py) < 140;
+    if (!nearSh && !nearF && !this.interiorActive()) {
+      this.msg("Move closer to the fire or shelter to sit (X).");
+      return;
+    }
+    this.sitting = true;
+    this.pmoving = false;
+    this.prunning = false;
+    this.pWalkBlend = 0;
+    // Naturally orient toward the fire or shelter hearth
+    if (f) {
+      this.pAngle = Math.atan2(f.y - this.py, f.x - this.px);
+    } else if (sh) {
+      this.pAngle = Math.atan2(sh.y - this.py, sh.x - this.px);
+    }
+    this.aimX = Math.cos(this.pAngle);
+    this.aimY = Math.sin(this.pAngle);
+    this.pfacing = Math.cos(this.pAngle) >= 0 ? 1 : -1;
+    audio.rustleCloth();
+    this.msg("You sit beside the fire. Warmth fills your limbs.", 3.5);
+    this.emit();
+  }
+
+  standUp() {
+    if (this.sitting) {
+      this.sitting = false;
+      audio.rustleCloth();
+      this.msg("You stand up.");
+      this.emit();
+    }
+  }
+
+  commandDogRest(): boolean {
+    const dog = this.dog();
+    if (!dog) return false;
+    const fire = this.nearest((e) => e.kind === "fire" || e.kind === "firePit", 350);
+    const shelter = this.nearest((e) => e.kind === "shelter", 350);
+    if (fire) {
+      dog.x = fire.x + 30;
+      dog.y = fire.y + 12;
+    } else if (shelter) {
+      dog.x = shelter.x + 22;
+      dog.y = shelter.y + 16;
+    }
+    dog.dogWait = true;
+    dog.dogState = "rest";
+    dog.vx = 0; dog.vy = 0;
+    this.floater(dog.x, dog.y - 28, "🐕 Rest by fire", "#fbbf24");
+    this.msg("Your dog curls up near the fire, resting warmly.");
+    audio.rustleCloth();
+    this.emit();
+    return true;
+  }
+
+  commandDogFollow(): boolean {
+    const dog = this.dog();
+    if (!dog) return false;
+    dog.dogWait = false;
+    dog.dogState = "follow";
+    this.floater(dog.x, dog.y - 28, "🐕 Follow!", "#a3e635");
+    this.msg("Your dog is following you.");
+    audio.dogBark();
+    this.emit();
+    return true;
+  }
+
   currentShelterTier() {
     let t = 0;
     for (const e of this.entities) if (e.kind === "shelter" && Math.hypot(e.x - this.px, e.y - this.py) < 130) t = Math.max(t, e.tier || 1);
@@ -418,6 +652,128 @@ export class Game {
     const site = this.entities.find((e) => e.kind === "buildSite" && e.site === "rack" && Math.hypot(e.x - this.px, e.y - this.py) < 220);
     const x = site ? site.x : this.px + this.pfacing * 50, y = site ? site.y : this.py + 10;
     if (this.constructRackAt(x, y) && site) site.dead = true;
+  }
+
+  // ---------- camp storage structures ----------
+  ensureCampStructures(shelter: Entity) {
+    const sx = shelter.x, sy = shelter.y;
+    const defs: { kind: EntityKind; dx: number; dy: number; capacity: number }[] = [
+      { kind: "woodStorage", dx: -68, dy: 22, capacity: WOOD_STORAGE_CAPACITY },
+      { kind: "foodStorage", dx: 68, dy: 18, capacity: FOOD_STORAGE_CAPACITY },
+      { kind: "waterStorage", dx: -54, dy: 72, capacity: WATER_STORAGE_CAPACITY },
+      { kind: "materialStorage", dx: 54, dy: 76, capacity: MATERIAL_STORAGE_CAPACITY },
+    ];
+    for (const d of defs) {
+      const existing = this.entities.find((e) => e.kind === d.kind && !e.dead && Math.hypot(e.x - (sx + d.dx), e.y - (sy + d.dy)) < 60);
+      if (!existing) {
+        const tx = sx + d.dx, ty = sy + d.dy;
+        this.entities = this.entities.filter((e) => !(STATIC_OBSTACLES.includes(e.kind) && Math.hypot(e.x - tx, e.y - ty) < 22));
+        this.entities.push({
+          id: this.nextId++,
+          kind: d.kind,
+          x: tx,
+          y: ty,
+          storage: {},
+          foodTimestamps: {},
+          capacity: d.capacity,
+        });
+      }
+    }
+  }
+
+  getCampTotals(): CampTotals {
+    let woodCur = 0, woodMax = WOOD_STORAGE_CAPACITY;
+    let foodCur = 0, foodMax = FOOD_STORAGE_CAPACITY;
+    let waterCur = 0, waterMax = WATER_STORAGE_CAPACITY;
+    let matCur = 0, matMax = MATERIAL_STORAGE_CAPACITY;
+
+    for (const e of this.entities) {
+      if (e.dead) continue;
+      if (e.kind === "woodStorage" && e.storage) {
+        woodCur += e.storage.wood || 0;
+        woodMax = e.capacity || WOOD_STORAGE_CAPACITY;
+      } else if (e.kind === "foodStorage" && e.storage) {
+        for (const k in e.storage) foodCur += e.storage[k as ItemId] || 0;
+        foodMax = e.capacity || FOOD_STORAGE_CAPACITY;
+      } else if (e.kind === "waterStorage" && e.storage) {
+        waterCur += (e.storage.water || 0) + (e.storage.streamWater || 0);
+        waterMax = e.capacity || WATER_STORAGE_CAPACITY;
+      } else if (e.kind === "materialStorage" && e.storage) {
+        for (const k in e.storage) matCur += e.storage[k as ItemId] || 0;
+        matMax = e.capacity || MATERIAL_STORAGE_CAPACITY;
+      }
+    }
+
+    return {
+      wood: { cur: woodCur, max: woodMax },
+      food: { cur: foodCur, max: foodMax },
+      water: { cur: waterCur, max: waterMax },
+      materials: { cur: matCur, max: matMax },
+    };
+  }
+
+  depositToStorage(e: Entity, item: ItemId, qty = 1): number {
+    const store = e.storage || (e.storage = {});
+    const cap = e.capacity || (e.kind === "woodStorage" ? WOOD_STORAGE_CAPACITY : e.kind === "foodStorage" ? FOOD_STORAGE_CAPACITY : e.kind === "waterStorage" ? WATER_STORAGE_CAPACITY : MATERIAL_STORAGE_CAPACITY);
+
+    let currentTotal = 0;
+    for (const k in store) currentTotal += store[k as ItemId] || 0;
+    const spaceLeft = Math.max(0, cap - currentTotal);
+    const have = this.inventory[item] || 0;
+    const amt = Math.min(qty, spaceLeft, have);
+    if (amt <= 0) {
+      if (spaceLeft <= 0) this.msg("Storage is full.");
+      return 0;
+    }
+
+    this.remove(item, amt);
+    store[item] = (store[item] || 0) + amt;
+
+    if (SHELF_LIFE[item]) {
+      const ft = e.foodTimestamps || (e.foodTimestamps = {});
+      const targetList = ft[item] || (ft[item] = []);
+      for (let i = 0; i < amt; i++) targetList.push(this.absTime());
+    }
+
+    audio.pickup();
+    this.pact = 0.25;
+    this.floater(e.x, e.y - 36, `+${amt} ${ITEMS[item].icon} stored`, "#38bdf8");
+    this.emit();
+    return amt;
+  }
+
+  withdrawFromStorage(e: Entity, item: ItemId, qty = 1): number {
+    const store = e.storage || (e.storage = {});
+    const storedAmt = store[item] || 0;
+    const amt = Math.min(qty, storedAmt);
+    if (amt <= 0) return 0;
+
+    store[item] = storedAmt - amt;
+    if (store[item] === 0) delete store[item];
+    this.add(item, amt);
+
+    if (SHELF_LIFE[item]) {
+      const ft = e.foodTimestamps;
+      if (ft && ft[item]) {
+        ft[item]!.splice(0, amt);
+      }
+    }
+
+    audio.pickup();
+    this.pact = 0.25;
+    this.floater(e.x, e.y - 36, `-${amt} ${ITEMS[item].icon} taken`, "#fcd34d");
+    this.emit();
+    return amt;
+  }
+
+  openStorage(e: Entity) {
+    this.activeStorageId = e.id;
+    this.emit();
+  }
+
+  closeStorage() {
+    this.activeStorageId = null;
+    this.emit();
   }
   private useRack(r: Entity) {
     const slots = r.slots || (r.slots = []);
@@ -566,10 +922,13 @@ export class Game {
   constructShelterAt(x: number, y: number) {
     if (!this.hasCost(SHELTER_COST)) { this.msg(this.missingText(SHELTER_COST)); audio.hurt(); return false; }
     this.payCost(SHELTER_COST);
-    this.entities.push({ id: this.nextId++, kind: "shelter", x, y, built: true, tier: 1 });
+    const sh: Entity = { id: this.nextId++, kind: "shelter", x, y, built: true, tier: 1 };
+    this.entities.push(sh);
+    this.ensureCampStructures(sh);
     audio.craft(); this.addShake(6); this.pact = 0.35;
     this.burst(x, y - 10, "#c8a06a", 26, "dust", 110);
-    this.floater(x, y - 60, "Lean-to built!", "#fcd34d");
+    this.floater(x, y - 60, "Lean-to built! Camp ready", "#fcd34d");
+    this.msg("Camp established! Wood, food, water, and material storage are ready around your shelter.", 5);
     return true;
   }
   constructFirePitAt(x: number, y: number) {
@@ -607,6 +966,9 @@ export class Game {
     }
     this.payCost(up.cost);
     e.tier = tier + 1;
+    if (e.tier >= 3 && e.fireplaceFuel === undefined) {
+      e.fireplaceFuel = 80;
+    }
     audio.craft(); audio.chop(); this.addShake(7); this.pact = 0.35;
     this.burst(e.x, e.y - 20, "#c8a06a", 30, "dust", 120);
     this.burst(e.x, e.y - 40, "#ffffff", 16, "snow", 80);
@@ -637,7 +999,12 @@ export class Game {
 
   // ---------- persistence: the camp & progress survive between sessions ----------
   serialize(): SaveData {
-    const campKinds: EntityKind[] = ["shelter", "fire", "firePit", "trap", "stump", "buildSite", "carcass", "spearOnGround", "dryingRack"];
+    const campKinds: EntityKind[] = [
+      "shelter", "fire", "firePit", "trap", "stump", "buildSite",
+      "carcass", "spearOnGround", "dryingRack",
+      "woodStorage", "foodStorage", "waterStorage", "materialStorage",
+      "dog"
+    ];
     const flying: Partial<Entity>[] = this.projectiles.map((p) => ({ kind: "spearOnGround" as EntityKind, x: p.x, y: p.y + 20, angle: 0 }));
     return {
       v: 2, seed: this.seed, px: this.px, py: this.py,
@@ -653,7 +1020,12 @@ export class Game {
       camp: this.entities.filter((e) => campKinds.includes(e.kind) && !e.dead).map((e): Partial<Entity> => ({
         kind: e.kind, x: e.x, y: e.y, tier: e.tier, fuel: e.fuel, built: e.built, caught: e.caught, life: e.life,
         site: e.site, carcassOf: e.carcassOf, angle: e.angle, scale: e.scale, baited: e.baited,
+        storage: e.storage ? { ...e.storage } : undefined,
+        capacity: e.capacity,
+        foodTimestamps: e.foodTimestamps ? JSON.parse(JSON.stringify(e.foodTimestamps)) : undefined,
         cook: e.cook ? e.cook.map((c) => ({ ...c })) : undefined, slots: e.slots ? [...e.slots] : undefined,
+        fireplaceFuel: e.fireplaceFuel,
+        dogHunger: e.dogHunger, dogState: e.dogState, dogWait: e.dogWait,
       })).concat(flying),
     };
   }
@@ -679,11 +1051,14 @@ export class Game {
     this.equipped = d.equipped && this.has(d.equipped) ? d.equipped : null;
     // clear the regenerated world where the camp stands, then put the camp back
     for (const c of d.camp) {
-      const clear = c.kind === "shelter" ? 70 : c.kind === "fire" || c.kind === "firePit" || c.kind === "dryingRack" ? 40 : 0;
+      const clear = c.kind === "shelter" ? 70 : c.kind === "fire" || c.kind === "firePit" || c.kind === "dryingRack" ? 40 : ["woodStorage", "foodStorage", "waterStorage", "materialStorage"].includes(c.kind!) ? 24 : 0;
       if (clear) this.entities = this.entities.filter((e) => !(STATIC_OBSTACLES.includes(e.kind) && Math.hypot(e.x - c.x!, e.y - c.y!) < clear));
       if (c.kind === "stump") this.entities = this.entities.filter((e) => !((e.kind === "smallTree" || e.kind === "tree") && Math.hypot(e.x - c.x!, e.y - c.y!) < 8));
       this.entities.push({ ...(c as Entity), id: this.nextId++ });
     }
+    const sh = this.entities.find((e) => e.kind === "shelter" && !e.dead);
+    if (sh) this.ensureCampStructures(sh);
+    this.ensureDog();
     this.message = `Day ${this.day}. Your camp is as you left it.`;
     this.messageTimer = 4;
   }
@@ -721,13 +1096,44 @@ export class Game {
     this.floater(this.px, this.py - 30, "Snare set", "#a3e635");
   }
   rest() {
-    if (!this.hasShelter()) { this.msg("You can only rest inside a shelter."); audio.hurt(); return; }
+    if (!this.hasShelter() && !this.interiorActive()) {
+      const f = this.nearest((e) => e.kind === "fire" || e.kind === "firePit");
+      if (f && Math.hypot(f.x - this.px, f.y - this.py) < 140) {
+        this.toggleSit();
+        return;
+      }
+      this.msg("You can sleep inside a shelter, or sit near the fire (X).");
+      audio.hurt();
+      return;
+    }
     if (this.carrying) { this.msg("Butcher the carcass first."); return; }
     if (this.resting) { this.resting = false; return; }
     this.resting = true; this.restProgress = 0;
     this.msg("You curl up in the shelter. The fire crackles…", 3);
   }
   eat(item: ItemId) {
+    if (!this.has(item)) return;
+    if (this.consuming) return; // already consuming
+    const isDrink = ["water", "streamWater", "snow"].includes(item);
+    const duration = isDrink ? 2.2 : 2.6;
+    this.consuming = {
+      item,
+      isDrink,
+      timer: duration,
+      total: duration,
+      stage: 0,
+    };
+    audio.rustleCloth();
+    if (isDrink) {
+      this.msg(item === "snow" ? "Scooping snow to mouth…" : "Raising container to drink…", 2.2);
+    } else {
+      const name = ITEMS[item]?.name || "food";
+      this.msg(`Eating ${name.toLowerCase()}…`, 2.5);
+    }
+    this.emit();
+  }
+
+  private finishConsuming(item: ItemId) {
     if (!this.has(item)) return;
     this.remove(item, 1);
     if (item === "water") {
@@ -785,6 +1191,8 @@ export class Game {
     const ang = Math.atan2((t.y - 10) - sy, t.x - sx) + (this.rng() - 0.5) * 2 * spread;
     const sp = 520;
     this.projectiles.push({ x: sx, y: sy, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp, dist: 0, max: 300, angle: ang });
+    this.pAngle = ang;
+    this.aimX = Math.cos(ang); this.aimY = Math.sin(ang);
     this.pfacing = Math.cos(ang) >= 0 ? 1 : -1;
     this.pact = 0.35;
     this.stamina = Math.max(0, this.stamina - 6);
@@ -808,6 +1216,7 @@ export class Game {
 
   primaryAction() {
     this.actHeld = true;
+    if (this.sitting) { this.standUp(); return; }
     if (this.resting) { this.resting = false; return; }
     if (this.fireLighting >= 0) return;
     if (this.tryReel()) return;
@@ -893,7 +1302,12 @@ export class Game {
   private act(e: Entity) {
     this.pact = 0.35;
     const d = Math.hypot(e.x - this.px, e.y - this.py);
-    if (Math.abs(e.x - this.px) > 4) this.pfacing = e.x > this.px ? 1 : -1;
+    if (Math.hypot(e.x - this.px, e.y - this.py) > 2) {
+      const targetAngle = Math.atan2(e.y - this.py, e.x - this.px);
+      this.pAngle = targetAngle;
+      this.aimX = Math.cos(targetAngle); this.aimY = Math.sin(targetAngle);
+      this.pfacing = Math.cos(targetAngle) >= 0 ? 1 : -1;
+    }
     switch (e.kind) {
       case "looseBranch":
         this.add("branch", 1);
@@ -1046,7 +1460,88 @@ export class Game {
         audio.pickup();
         this.floater(e.x, e.y - 20, "Spear retrieved", "#e2e8f0");
         break;
+      case "woodStorage":
+      case "foodStorage":
+      case "waterStorage":
+      case "materialStorage":
+        this.openStorage(e);
+        break;
+      case "dog":
+        this.openDog(e);
+        break;
     }
+  }
+
+  // ---------- dog companion interactions ----------
+  dog(): Entity | null {
+    return this.entities.find((e) => e.kind === "dog" && !e.dead) || null;
+  }
+
+  openDog(dog: Entity) {
+    this.activeDogId = dog.id;
+    this.emit();
+  }
+
+  closeDog() {
+    this.activeDogId = null;
+    this.emit();
+  }
+
+  petDog() {
+    const dog = this.dog();
+    if (!dog) return;
+    dog.dogState = "pet";
+    dog.dogStateTimer = 2.2;
+    dog.dogTailWag = 1;
+    this.floater(dog.x, dog.y - 28, "❤ Good dog!", "#f43f5e");
+    this.pact = 0.35;
+    audio.dogHappy();
+    this.emit();
+  }
+
+  feedDog(specificItem?: ItemId): boolean {
+    const dog = this.dog();
+    if (!dog) return false;
+    const candidates: ItemId[] = ["cookedMeat", "cookedFish", "driedMeat", "meat", "fish"];
+    const item = specificItem && this.has(specificItem) && candidates.includes(specificItem)
+      ? specificItem
+      : candidates.find((id) => this.has(id));
+
+    if (!item) {
+      this.msg("No meat or fish to feed the dog.");
+      audio.hurt();
+      return false;
+    }
+
+    this.remove(item, 1);
+    const hungerVal = item === "cookedMeat" || item === "cookedFish" ? 45 : item === "driedMeat" ? 35 : 25;
+    dog.dogHunger = Math.min(100, (dog.dogHunger ?? 50) + hungerVal);
+    dog.dogState = "eat";
+    dog.dogStateTimer = 3.0;
+    this.floater(dog.x, dog.y - 30, `+${ITEMS[item].icon} Fed dog!`, "#a3e635");
+    this.pact = 0.35;
+    audio.eat();
+    audio.dogHappy();
+    this.emit();
+    return true;
+  }
+
+  toggleDogWait(): boolean {
+    const dog = this.dog();
+    if (!dog) return false;
+    dog.dogWait = !dog.dogWait;
+    if (dog.dogWait) {
+      dog.dogState = "sit";
+      this.floater(dog.x, dog.y - 28, "🐕 Wait here", "#fbbf24");
+      this.msg("You told your dog to wait here.");
+    } else {
+      dog.dogState = "follow";
+      this.floater(dog.x, dog.y - 28, "🐕 Follow!", "#a3e635");
+      this.msg("Your dog is following you.");
+    }
+    audio.dogBark();
+    this.emit();
+    return dog.dogWait;
   }
 
   startFishing(hole: Entity) {
@@ -1101,8 +1596,25 @@ export class Game {
 
     this.weatherTimer -= dt;
     if (this.weatherTimer <= 0) this.pickWeather();
-    const targetStorm = this.weather === "storm" ? 1 : this.weather === "snow" ? 0.4 : 0.05;
-    this.storm += (targetStorm - this.storm) * dt * 0.5;
+
+    // Storm phase progression
+    if (this.weather === "storm") {
+      if (this.stormApproachTimer > 0) {
+        this.stormApproachTimer -= dt;
+        if (this.stormApproachTimer <= 0) {
+          this.stormPhase = "blizzard";
+        }
+      }
+    } else {
+      this.stormPhase = "none";
+      this.stormApproachTimer = 0;
+    }
+
+    const targetStorm = this.weather === "storm" 
+      ? (this.stormPhase === "approaching" ? 0.4 : 1.0) 
+      : this.weather === "snow" ? 0.35 : 0.05;
+    this.storm += (targetStorm - this.storm) * dt * (this.weather === "storm" ? 0.35 : 0.5);
+
     // shelter view bookkeeping
     if (this.shelterPress && this.actHeld) {
       this.shelterPress.t += dt;
@@ -1113,6 +1625,9 @@ export class Game {
       if (this.input.up || this.input.down || this.input.left || this.input.right || this.joy.active) this.wakeLinger = 0;
     }
     const inside = this.interiorActive();
+    this.pIdleAnim += dt;
+
+    const isStormActive = this.weather === "storm" && this.storm > 0.35;
 
     // movement
     let dx = 0, dy = 0;
@@ -1125,78 +1640,321 @@ export class Game {
     }
     const mag = Math.hypot(dx, dy);
     if (mag > 0.15) {
+      if (this.sitting) {
+        this.standUp();
+      }
       const nx = dx / Math.max(1, mag), ny = dy / Math.max(1, mag);
       // run with Shift, or by pushing the touch stick all the way out
       const wantRun = this.input.run || (this.joy.active && Math.hypot(this.joy.x, this.joy.y) > 0.92);
-      this.prunning = wantRun && this.stamina > 8 && !this.carrying;
-      const winter = 1 - Math.min(0.3, (this.day - 1) * 0.025);
-      const cold = this.temp < 25 ? 0.65 : 1;
-      const tired = this.stamina < 15 ? 0.6 : 1;
+      this.prunning = wantRun && this.stamina > 8 && !this.carrying && !this.consuming;
+      const winter = 1 - Math.min(0.2, (this.day - 1) * 0.02);
+      const cold = this.temp < 25 ? 0.72 : 1;
+      const tired = this.stamina < 15 ? 0.65 : 1;
       const load = this.carrying ? (this.carrying === "deer" ? 0.65 : 0.85) : 1;
       const gait = this.prunning ? 1.5 : 1;
-      const speed = 155 * gait * winter * cold * tired * load * (1 - this.storm * 0.3);
+      // Storm struggle: struggling against howling blizzard when exposed
+      const stormStruggle = isStormActive && !inside ? Math.max(0.4, 1 - this.stormExposure * 0.6) : 1;
+      const consumeSlow = this.consuming ? 0.55 : 1;
+      const speed = 155 * gait * winter * cold * tired * load * (1 - this.storm * 0.25) * stormStruggle * consumeSlow;
       this.px = Math.max(40, Math.min(WORLD_SIZE - 40, this.px + nx * speed * dt));
       this.py = Math.max(40, Math.min(WORLD_SIZE - 40, this.py + ny * speed * dt));
-      const m = Math.hypot(nx, ny);
-      this.aimX = nx / m; this.aimY = ny / m;
-      if (Math.abs(nx) > 0.05) this.pfacing = nx > 0 ? 1 : -1;
+
+      // smooth angular steering toward movement direction
+      const targetAngle = Math.atan2(ny, nx);
+      this.pMoveAngle = targetAngle;
+      let diff = targetAngle - this.pAngle;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      const turnSpeed = this.prunning ? 16 : 12;
+      const turnDamp = Math.min(1, Math.max(0.2, Math.abs(diff) / Math.PI));
+      const step = Math.sign(diff) * Math.min(Math.abs(diff), turnSpeed * dt * (0.5 + 0.6 * turnDamp));
+      this.pAngle += step;
+      while (this.pAngle < -Math.PI) this.pAngle += Math.PI * 2;
+      while (this.pAngle > Math.PI) this.pAngle -= Math.PI * 2;
+
+      this.aimX = Math.cos(this.pAngle);
+      this.aimY = Math.sin(this.pAngle);
+      this.pfacing = Math.cos(this.pAngle) >= 0 ? 1 : -1;
+
       this.pmoving = true;
-      this.panim += dt * (this.prunning ? 17 : 11);
+      this.pWalkBlend = Math.min(1, this.pWalkBlend + dt * 8);
+      const animRate = (speed / 155) * (this.prunning ? 14 : 9.5);
+      this.panim += dt * animRate;
       this.stamina = Math.max(0, this.stamina - dt * (this.prunning ? 7 : this.carrying ? 2.2 : 0.9));
-      this.footTimer -= dt;
-      if (this.footTimer <= 0) {
+
+      // Synchronize footsteps with stride phase crossing each half-stride (Pi)
+      const currentStep = Math.floor(this.panim / Math.PI);
+      if (currentStep > this.lastStepIndex) {
+        this.lastStepIndex = currentStep;
+        this.footSide = (currentStep % 2 === 0) ? 1 : -1;
         audio.footstep(this.prunning);
-        this.footTimer = this.prunning ? 0.27 : this.carrying ? 0.5 : 0.42;
-        this.burst(this.px, this.py + 2, "#e8f2ff", this.prunning ? 4 : 2, "snow", this.prunning ? 50 : 26);
+        if (currentStep % 2 === 0 && Math.random() < 0.55) {
+          audio.rustleCloth();
+        }
+
+        const latX = -Math.sin(this.pAngle);
+        const latY = Math.cos(this.pAngle) * 0.55;
+        const fwdX = Math.cos(this.pAngle);
+        const fwdY = Math.sin(this.pAngle) * 0.65;
+        const hipW = 4.2;
+        const stepReach = (this.prunning ? 4.6 : 3.2);
+
+        const printX = this.px + latX * hipW * this.footSide + fwdX * stepReach * 0.35;
+        const printY = this.py + latY * hipW * this.footSide + fwdY * stepReach * 0.35;
+
+        this.playerPrints.push({
+          x: printX,
+          y: printY,
+          angle: this.pAngle,
+          side: this.footSide,
+          life: 18,
+          maxLife: 18,
+        });
+        if (this.playerPrints.length > 60) this.playerPrints.shift();
+        this.burst(printX, printY + 1, "#e8f2ff", this.prunning ? 3 : 1, "snow", this.prunning ? 36 : 18);
       }
     } else {
       this.pmoving = false;
       this.prunning = false;
-      this.footTimer = 0.08;
+      this.pWalkBlend = Math.max(0, this.pWalkBlend - dt * 5.0);
       this.stamina = Math.min(100, this.stamina + dt * 5);
+    }
+
+    // Smooth sit transition blend
+    if (this.sitting) {
+      this.sitTransition = Math.min(1, this.sitTransition + dt * 3.5);
+    } else {
+      this.sitTransition = Math.max(0, this.sitTransition - dt * 4.0);
+    }
+
+    // Consuming food/drink animation and timers
+    if (this.consuming) {
+      this.consuming.timer -= dt;
+      const progress = 1 - (this.consuming.timer / this.consuming.total);
+      if (this.consuming.isDrink) {
+        if (progress > 0.32 && this.consuming.stage === 0) {
+          audio.drink();
+          this.consuming.stage = 1;
+        } else if (progress > 0.72 && this.consuming.stage === 1) {
+          audio.drinkSwallow();
+          this.consuming.stage = 2;
+        }
+      } else {
+        if (progress > 0.28 && this.consuming.stage === 0) {
+          audio.eat();
+          this.consuming.stage = 1;
+        } else if (progress > 0.65 && this.consuming.stage === 1) {
+          audio.eat();
+          this.consuming.stage = 2;
+        }
+      }
+      if (this.consuming.timer <= 0) {
+        this.finishConsuming(this.consuming.item);
+        this.consuming = null;
+        this.emit();
+      }
+    }
+
+    // decay player footprints in snow (faster in storms)
+    for (let i = this.playerPrints.length - 1; i >= 0; i--) {
+      const pr = this.playerPrints[i];
+      pr.life -= dt * (1 + this.storm * 2.5);
+      if (pr.life <= 0) this.playerPrints.splice(i, 1);
     }
     if (this.pact > 0) this.pact -= dt;
     if (this.hurtFlash > 0) this.hurtFlash = Math.max(0, this.hurtFlash - dt);
 
-    // temperature
+    // temperature & warmth
     const daylight = this.daylight();
-    const heat = this.fireHeat();
-    const byFire = heat > 0.3;
-    const ambient = 8 - (1 - daylight) * 22 - (this.day - 1) * 2.2 - this.storm * 20;
-    let warm = 34 * heat;
-    if (this.has("torch")) warm += 4;
+    const fpHeat = this.fireplaceHeat();
+    const heat = Math.max(this.fireHeat(), fpHeat);
+    const byFire = heat > 0.22 || this.sitting;
     const tier = this.currentShelterTier();
-    warm += SHELTER_WARMTH[Math.min(3, tier)] || 0;
-    // a good shelter also blocks most of the storm wind
-    if (tier > 0) warm += this.storm * (tier >= 2 ? 14 : 7);
+
+    // Cold exposure handling: ONLY accumulates during an active snowstorm when outside and away from fire
+    if (isStormActive && !inside && !byFire) {
+      this.stormExposure = Math.min(1, this.stormExposure + dt * 0.035);
+    } else {
+      // Rapid recovery near fire or inside shelter
+      const recRate = inside ? (tier >= 3 ? 0.45 : 0.3) : byFire ? (this.sitting ? 0.45 : 0.28) : 0.15;
+      this.stormExposure = Math.max(0, this.stormExposure - dt * recRate);
+    }
+
+    // Ambient temperature:
+    // NORMAL WEATHER: Peaceful survival, mild crisp winter cold
+    // SNOWSTORM: Serious danger, sharp plummet in temperature
+    let ambient = 12 - (1 - daylight) * 12 - (this.day - 1) * 1.2;
+    if (isStormActive) {
+      ambient -= this.storm * 35;
+    }
+
+    let warm = 40 * heat;
+    if (this.sitting) warm += 18; // Sitting beside the fire provides stronger warmth!
+    if (this.has("torch")) warm += 5;
+
+    if (inside) {
+      if (tier >= 3) {
+        // Proper wooden hut: stops freezing progression, warm interior atmosphere
+        ambient += isStormActive ? this.storm * 35 + 20 : 18;
+        warm += 28;
+        if (this.sitting) warm += 16;
+      } else if (tier === 2) {
+        ambient += isStormActive ? this.storm * 22 + 10 : 12;
+        warm += 18;
+      } else {
+        ambient += isStormActive ? this.storm * 14 + 6 : 8;
+        warm += 12;
+      }
+    } else {
+      warm += SHELTER_WARMTH[Math.min(3, tier)] || 0;
+      if (tier > 0 && isStormActive) warm += this.storm * (tier >= 2 ? 16 : 8);
+      if (tier >= 3 && fpHeat > 0) {
+        warm += 10 * fpHeat;
+      }
+    }
     warm += this.clothingWarmth();
-    const target = Math.max(0, Math.min(100, 55 + ambient + warm));
-    const rate = this.temp < target ? 0.25 + heat * 0.7 : 0.33;
+
+    // TARGET TEMPERATURE & SAFETY:
+    // In normal weather (no storm), target temp NEVER drops below safe minimum (42).
+    // Severe cold and freezing system ONLY activate during genuine snowstorm.
+    let target = 55 + ambient + warm;
+    if (!isStormActive) {
+      target = Math.max(42, Math.min(100, target));
+      if (this.temp < 40) {
+        this.temp += (42 - this.temp) * dt * 0.8;
+      }
+    } else {
+      target = Math.max(4, Math.min(100, target));
+    }
+
+    const rate = this.temp < target 
+      ? (0.35 + (this.sitting ? 0.5 : 0) + heat * 0.9) 
+      : (0.28 + (isStormActive && !inside ? 0.25 : 0));
     this.temp += (target - this.temp) * dt * rate;
     this.temp = Math.max(0, Math.min(100, this.temp));
 
-    this.hunger = Math.max(0, this.hunger - dt * 0.16);
-    this.thirst = Math.max(0, this.thirst - dt * 0.21);
+    // Hunger and Thirst decay at reasonable rates
+    this.hunger = Math.max(0, this.hunger - dt * 0.13);
+    this.thirst = Math.max(0, this.thirst - dt * 0.17);
 
+    // Energy recovery when resting, sitting, or inside hut
+    if (this.sitting) {
+      this.stamina = Math.min(100, this.stamina + dt * 6.5);
+    }
+    if (inside && tier >= 3) {
+      this.stamina = Math.min(100, this.stamina + dt * 5.5);
+      this.health = Math.min(100, this.health + dt * 0.8);
+    }
+
+    // Struggling in storm outside drains stamina
+    if (isStormActive && !inside && !byFire) {
+      this.stamina = Math.max(0, this.stamina - dt * (1.2 + this.stormExposure * 2.2));
+    }
+
+    // Realistic coughing, gasping, and strained breathing sounds during storm exposure
+    if (isStormActive && !inside && !byFire && this.stormExposure > 0.2) {
+      this.exposureSoundTimer -= dt;
+      if (this.exposureSoundTimer <= 0) {
+        if (this.temp < 14 || this.stormExposure > 0.65) {
+          audio.cough();
+          this.floater(this.px, this.py - 38, "*cough*", "#bae6fd");
+        } else if (this.temp < 22 || this.stormExposure > 0.4) {
+          audio.gasp();
+        } else {
+          audio.strainedBreath();
+        }
+        this.exposureSoundTimer = 3.5 + this.rng() * 4.0;
+      }
+    }
+
+    // HEALTH & SURVIVAL RULES:
+    // NORMAL WEATHER = peaceful survival (player must NOT suddenly die)
+    // SNOWSTORM = serious danger (prolonged critical exposure before collapse)
     let hp = this.health;
-    if (this.temp < 20) hp -= dt * (20 - this.temp) * 0.15;
-    if (this.hunger <= 0) hp -= dt * 1.5;
-    if (this.thirst <= 0) hp -= dt * 2;
-    if (this.temp > 35 && this.hunger > 20 && this.thirst > 20) hp += dt * (byFire ? 1.5 : 0.4);
+
+    if (isStormActive && !inside && !byFire) {
+      // Freezing damage only during active storm when temp is dangerously low
+      if (this.temp < 16) {
+        hp -= dt * (16 - this.temp) * 0.15;
+      }
+      // Critical exposure timer: prolonged cold exposure before collapse (at least 60s outside ignoring warnings)
+      if (this.temp < 10) {
+        this.criticalColdTimer -= dt;
+        if (this.criticalColdTimer <= 0) {
+          this.die();
+          return;
+        }
+      } else {
+        this.criticalColdTimer = Math.min(60, this.criticalColdTimer + dt * 4);
+      }
+    } else {
+      // Normal weather or safe inside / by fire:
+      this.criticalColdTimer = Math.min(60, this.criticalColdTimer + dt * 10);
+
+      // Starvation / dehydration during normal weather:
+      // Gentle decay, and CANNOT drop health below 20!
+      if (this.hunger <= 0 && hp > 20) {
+        hp = Math.max(20, hp - dt * 0.15);
+      }
+      if (this.thirst <= 0 && hp > 20) {
+        hp = Math.max(20, hp - dt * 0.2);
+      }
+    }
+
+    // Natural healing when warm & fed & watered
+    if (this.temp > 35 && this.hunger > 20 && this.thirst > 20) {
+      hp += dt * (byFire ? 1.6 : inside ? 1.2 : 0.4);
+    }
     this.health = Math.max(0, Math.min(100, hp));
     if (this.health <= 0) { this.die(); return; }
 
-    // survival warnings
+    // Survival guidance messages & warnings
     this.warnTimer -= dt;
-    if (this.warnTimer <= 0 && this.messageTimer <= 0) {
-      if (this.thirst < 30) {
-        this.msg(this.has("water") ? "Your water is low. Tap 💧 in your pack to drink."
-          : this.has("barkPot") ? "Your water is low. Melt snow in your bark pot at the fire."
-          : "Your water is low. Craft a bark pot (🛠️) and melt snow at the fire.", 4);
-        this.warnTimer = 25;
+    if (this.weather === "storm" && this.stormPhase === "approaching") {
+      this.survivalWarning = "Snowstorm approaching. Get near the fire or return to your shelter.";
+      if (this.warnTimer <= 0) {
+        this.msg(this.survivalWarning, 5);
+        this.warnTimer = 10;
       }
-      else if (this.hunger < 25) { this.msg("You're starving. Cook meat at the fire and tap it to eat.", 4); this.warnTimer = 25; }
-      else if (this.temp < 30) { this.msg("You're freezing! Get to your fire.", 4); this.warnTimer = 20; }
+    } else if (isStormActive && !inside && !byFire) {
+      if (this.temp < 14 || this.criticalColdTimer < 40) {
+        this.survivalWarning = "Severe cold. Find shelter immediately.";
+        if (this.warnTimer <= 0) {
+          this.msg(this.survivalWarning, 4);
+          this.warnTimer = 6;
+        }
+      } else if (this.temp < 28 || this.stormExposure > 0.25) {
+        this.survivalWarning = "You're freezing. Get inside the hut or stay near the fire.";
+        if (this.warnTimer <= 0) {
+          this.msg(this.survivalWarning, 4);
+          this.warnTimer = 8;
+        }
+      } else {
+        this.survivalWarning = "Snowstorm active. Seek fire or shelter.";
+        if (this.warnTimer <= 0) {
+          this.msg(this.survivalWarning, 4);
+          this.warnTimer = 10;
+        }
+      }
+    } else if (!isStormActive) {
+      if (this.thirst < 25) {
+        this.survivalWarning = "Water is low. Tap 💧 in pack or melt snow at fire.";
+        if (this.warnTimer <= 0) {
+          this.msg(this.survivalWarning, 4);
+          this.warnTimer = 25;
+        }
+      } else if (this.hunger < 25) {
+        this.survivalWarning = "Hunger is low. Cook meat at the fire and eat.";
+        if (this.warnTimer <= 0) {
+          this.msg(this.survivalWarning, 4);
+          this.warnTimer = 25;
+        }
+      } else {
+        this.survivalWarning = "";
+      }
+    } else {
+      // Safe inside shelter or by fire during storm
+      this.survivalWarning = "";
     }
 
     // fires: burn fuel gradually (faster in storms and while you sleep, since time passes faster)
@@ -1220,6 +1978,40 @@ export class Game {
       if (this.rng() < 0.7 * intensity) this.particles.push({ x: e.x + (this.rng() - 0.5) * 14, y: e.y - 6, vx: (this.rng() - 0.5) * 10, vy: -30 - this.rng() * 30, life: 0.5 + this.rng() * 0.5, maxLife: 1, color: this.rng() < 0.5 ? "#ffb14e" : "#ff7b00", size: 2 + this.rng() * 3, gravity: -30, kind: "spark" });
       if (this.rng() < 0.25) this.particles.push({ x: e.x + (this.rng() - 0.5) * 6, y: e.y - 26, vx: 6 + this.rng() * 8 - this.storm * 20, vy: -22 - this.rng() * 10, life: 1.8, maxLife: 2, color: "rgba(150,150,155,0.35)", size: 4 + this.rng() * 4, gravity: -4, kind: "dust" });
     }
+
+    // wooden hut fireplace fuel consumption
+    const hut = this.hutShelter();
+    if (hut && (hut.tier || 1) >= 3) {
+      if (hut.fireplaceFuel === undefined) hut.fireplaceFuel = 80;
+      if (hut.fireplaceFuel > 0) {
+        const fpBurn = 0.26 * (this.resting ? 3.5 : 1);
+        const before = hut.fireplaceFuel;
+        hut.fireplaceFuel = Math.max(0, before - dt * fpBurn);
+        const d = Math.hypot(hut.x - this.px, hut.y - this.py);
+        if (before > 20 && hut.fireplaceFuel <= 20 && (d < 500 || inside)) {
+          this.msg("The fireplace in your wooden hut is burning low. Add wood.", 4);
+        }
+        if (hut.fireplaceFuel <= 0 && before > 0 && (d < 500 || inside)) {
+          this.msg("The hut fireplace has gone out. Add wood to relight it.", 4);
+        }
+        const intensity = Math.min(1, hut.fireplaceFuel / 40 + 0.3);
+        if (inside) {
+          if (intensity > fireIntensity) {
+            fireProx = 1.0;
+            fireIntensity = intensity;
+            firePan = 0;
+          }
+        } else if (d < 180) {
+          const prox = Math.max(0, 1 - d / 180) * 0.75;
+          if (prox > fireProx) {
+            fireProx = prox;
+            fireIntensity = intensity * 0.8;
+            firePan = Math.max(-1, Math.min(1, (hut.x - this.px) / 200));
+          }
+        }
+      }
+    }
+
     audio.update({
       dt, storm: this.storm, snowing: this.weather !== "clear", night: this.daylight() < 0.3,
       day: this.day, fireProx, fireIntensity, firePan,
@@ -1231,6 +2023,7 @@ export class Game {
     if (this.saveTimer > 6 && this.onSave) { this.saveTimer = 0; this.onSave(this.serialize()); }
 
     this.updateAnimals(dt);
+    this.updateDog(dt);
     this.updateProjectiles(dt);
 
     for (const e of this.entities) {
@@ -1288,6 +2081,28 @@ export class Game {
     // aim info
     this.animalNear = !!this.nearest((e) => ANIMALS.includes(e.kind), 360);
     this.aimTarget = this.has("spear") ? this.throwTargetCandidate() : null;
+
+    // auto-close storage modal if player moves away
+    if (this.activeStorageId) {
+      const st = this.entities.find((e) => e.id === this.activeStorageId && !e.dead);
+      if (!st || Math.hypot(st.x - this.px, st.y - this.py) > 130) {
+        this.activeStorageId = null;
+      }
+    }
+
+    // auto-close dog modal if player moves away
+    if (this.activeDogId) {
+      const dog = this.entities.find((e) => e.id === this.activeDogId && !e.dead);
+      if (!dog || Math.hypot(dog.x - this.px, dog.y - this.py) > 130) {
+        this.activeDogId = null;
+      }
+    }
+
+    // ensure camp storage structures if shelter exists
+    const sh = this.entities.find((e) => e.kind === "shelter" && !e.dead);
+    if (sh && !this.entities.some((e) => e.kind === "woodStorage" && !e.dead)) {
+      this.ensureCampStructures(sh);
+    }
 
     this.updateJourney();
     this.emit();
@@ -1490,12 +2305,167 @@ export class Game {
     }
   }
 
+  private updateDog(dt: number) {
+    const dog = this.dog();
+    if (!dog) return;
+
+    // Slow natural hunger decay (never dies, min 10)
+    dog.dogHunger = Math.max(10, (dog.dogHunger ?? 85) - dt * 0.04);
+
+    // Transient state timers (eating, petting)
+    if (dog.dogStateTimer && dog.dogStateTimer > 0) {
+      dog.dogStateTimer -= dt;
+      if (dog.dogStateTimer <= 0) {
+        dog.dogState = "follow";
+      }
+    }
+
+    const dToPlayer = Math.hypot(dog.x - this.px, dog.y - this.py);
+
+    // Camp detection (shelter or fireplace/campfire)
+    const shelter = this.entities.find((e) => e.kind === "shelter" && !e.dead);
+    const fire = this.entities.find((e) => (e.kind === "fire" || e.kind === "firePit") && !e.dead);
+    const camp = shelter || fire;
+    const playerInCamp = camp && Math.hypot(this.px - camp.x, this.py - camp.y) < 220;
+    const dogInCamp = camp && Math.hypot(dog.x - camp.x, dog.y - camp.y) < 250;
+    const nightTime = this.daylight() < 0.2;
+
+    if (dog.dogState === "eat" || dog.dogState === "pet") {
+      // Stay in place during eating or being petted
+      dog.vx = (dog.vx || 0) * 0.7;
+      dog.vy = (dog.vy || 0) * 0.7;
+    } else if (dog.dogWait) {
+      // Commanded to wait
+      dog.vx = (dog.vx || 0) * 0.7;
+      dog.vy = (dog.vy || 0) * 0.7;
+      dog.dogState = "sit";
+    } else if (this.resting && dogInCamp) {
+      // Player is sleeping/resting in shelter: dog lies down near shelter entrance
+      const targetX = shelter ? shelter.x + 22 : this.px + 20;
+      const targetY = shelter ? shelter.y + 16 : this.py;
+      const d = Math.hypot(dog.x - targetX, dog.y - targetY);
+      if (d > 24) {
+        const a = Math.atan2(targetY - dog.y, targetX - dog.x);
+        dog.vx = Math.cos(a) * 75; dog.vy = Math.sin(a) * 75;
+        dog.dogState = "follow";
+      } else {
+        dog.vx = 0; dog.vy = 0;
+        dog.dogState = "rest";
+      }
+    } else if (this.sitting && fire) {
+      // Player is sitting by fire: dog settles beside the fire, enjoying warmth
+      const targetX = fire.x + 32;
+      const targetY = fire.y + 12;
+      const d = Math.hypot(dog.x - targetX, dog.y - targetY);
+      if (d > 26) {
+        const a = Math.atan2(targetY - dog.y, targetX - dog.x);
+        dog.vx = Math.cos(a) * 80; dog.vy = Math.sin(a) * 80;
+        dog.dogState = "follow";
+      } else {
+        dog.vx = 0; dog.vy = 0;
+        dog.dogState = "sit";
+      }
+    } else if (playerInCamp && nightTime && !this.pmoving) {
+      // Night at camp: dog stays near shelter or fire, resting
+      const homeX = shelter ? shelter.x + 18 : camp.x;
+      const homeY = shelter ? shelter.y + 14 : camp.y;
+      const d = Math.hypot(dog.x - homeX, dog.y - homeY);
+      if (d > 35) {
+        const a = Math.atan2(homeY - dog.y, homeX - dog.x);
+        dog.vx = Math.cos(a) * 75; dog.vy = Math.sin(a) * 75;
+        dog.dogState = "follow";
+      } else {
+        dog.vx = 0; dog.vy = 0;
+        dog.dogState = "rest";
+      }
+    } else {
+      // Follow player logic:
+      const followDist = 56;
+      const minBuffer = 34; // personal space buffer: avoid walking through player
+
+      if (dToPlayer > followDist) {
+        // Track player pace:
+        let speed = 85;
+        if (dToPlayer > 300) speed = 210; // catch up sprint
+        else if (dToPlayer > 130 || this.prunning) speed = 175; // run
+        else if (this.pmoving) speed = 95; // walk
+
+        const a = Math.atan2(this.py - dog.y, this.px - dog.x);
+        let moveX = Math.cos(a) * speed;
+        let moveY = Math.sin(a) * speed;
+
+        // Obstacle avoidance (trees, rocks, storage boxes)
+        for (const obs of this.entities) {
+          if (obs.dead || !STATIC_OBSTACLES.includes(obs.kind)) continue;
+          const dObs = Math.hypot(dog.x - obs.x, dog.y - obs.y);
+          if (dObs < 28 && dObs > 1) {
+            const pushA = Math.atan2(dog.y - obs.y, dog.x - obs.x);
+            const pushMag = (28 - dObs) * 4.5;
+            moveX += Math.cos(pushA) * pushMag;
+            moveY += Math.sin(pushA) * pushMag;
+          }
+        }
+
+        dog.vx = moveX;
+        dog.vy = moveY;
+        dog.dogState = speed > 110 ? "run" : "follow";
+      } else if (dToPlayer < minBuffer) {
+        // Gently step back or aside: don't overlap player
+        const a = Math.atan2(dog.y - this.py, dog.x - this.px);
+        dog.vx = Math.cos(a) * 35;
+        dog.vy = Math.sin(a) * 35;
+        dog.dogState = "follow";
+      } else {
+        // Within comfortable following distance and player stopped
+        dog.vx = (dog.vx || 0) * 0.72;
+        dog.vy = (dog.vy || 0) * 0.72;
+        if (Math.hypot(dog.vx || 0, dog.vy || 0) < 5) {
+          dog.vx = 0; dog.vy = 0;
+          dog.dogState = (playerInCamp && fire) ? "sit" : "idle";
+        }
+      }
+    }
+
+    // Orientation
+    if (Math.abs(dog.vx || 0) > 4) {
+      dog.angle = (dog.vx || 0) > 0 ? 1 : -1;
+    } else {
+      dog.angle = this.px >= dog.x ? 1 : -1;
+    }
+
+    // Animation accumulator
+    const curSpeed = Math.hypot(dog.vx || 0, dog.vy || 0);
+    dog.dogAnim = (dog.dogAnim || 0) + dt * (curSpeed > 110 ? 14 : curSpeed > 15 ? 8.5 : 2);
+
+    // Position integration with world boundaries
+    dog.x = Math.max(30, Math.min(WORLD_SIZE - 30, dog.x + (dog.vx || 0) * dt));
+    dog.y = Math.max(30, Math.min(WORLD_SIZE - 30, dog.y + (dog.vy || 0) * dt));
+  }
+
   private pickWeather() {
     const r = this.rng();
-    const stormChance = this.day === 1 ? 0 : 0.18 + Math.min(0.4, (this.day - 2) * 0.06);
-    if (r < stormChance) { this.weather = "storm"; this.weatherTimer = 20 + this.rng() * 15; this.msg("⚠ A snowstorm is coming! Get to your shelter and fire.", 5); audio.wolf(); }
-    else if (r < stormChance + 0.4) { this.weather = "snow"; this.weatherTimer = 30 + this.rng() * 25; }
-    else { this.weather = "clear"; this.weatherTimer = 30 + this.rng() * 30; }
+    const stormChance = this.day === 1 ? 0 : 0.18 + Math.min(0.35, (this.day - 2) * 0.05);
+    if (r < stormChance) {
+      this.weather = "storm";
+      this.stormPhase = "approaching";
+      this.stormApproachTimer = 10;
+      this.weatherTimer = 45 + this.rng() * 25;
+      this.survivalWarning = "Snowstorm approaching. Get near the fire or return to your shelter.";
+      this.msg(this.survivalWarning, 6);
+      audio.wolf();
+    } else if (r < stormChance + 0.4) {
+      this.weather = "snow";
+      this.stormPhase = "none";
+      this.stormApproachTimer = 0;
+      this.survivalWarning = "";
+      this.weatherTimer = 35 + this.rng() * 25;
+    } else {
+      this.weather = "clear";
+      this.stormPhase = "none";
+      this.stormApproachTimer = 0;
+      this.survivalWarning = "";
+      this.weatherTimer = 35 + this.rng() * 30;
+    }
   }
 
   daylight() {
@@ -1532,6 +2502,10 @@ export class Game {
         bush: "Strip fiber", snowPile: "Scoop snow", waterHole: this.has("fishingRod") ? "Fish / drink" : "Drink water",
         rabbit: "Grab rabbit", deer: "Need a spear", wolf: "Wolf! Back away", trap: best.caught ? "Collect catch" : "Check snare",
         firePit: "HOLD to light fire", fire: "Feed the fire", carcass: "Lift carcass", spearOnGround: "Pick up spear",
+        woodStorage: "Wood Storage (ACT — Store / Take)",
+        foodStorage: "Food Storage (ACT — Store / Take)",
+        waterStorage: "Water Storage (ACT — Store / Take)",
+        materialStorage: "General Storage (ACT — Store / Take)",
         buildSite: best.site === "shelter" ? "Build lean-to" : best.site === "rack" ? "Build drying rack" : "Build fire",
         dryingRack: (() => {
           const s = best.slots || [];
@@ -1539,15 +2513,28 @@ export class Game {
           if (this.has("meat") && s.length < RACK_SLOTS) return `Hang raw meat (${s.length}/${RACK_SLOTS})`;
           return s.length ? "Meat drying…" : "Drying rack (empty)";
         })(),
+        dog: (() => {
+          const hasFood = this.has("cookedMeat") || this.has("cookedFish") || this.has("driedMeat") || this.has("meat") || this.has("fish");
+          return hasFood ? "Dog (E — Interact / Feed 🍖)" : "Dog (E — Interact 🐾)";
+        })(),
         shelter: (() => {
-          const up = SHELTER_UPGRADES[best.tier || 1];
-          const name = SHELTER_NAMES[best.tier || 1];
+          const tier = best.tier || 1;
+          const up = SHELTER_UPGRADES[tier];
+          const name = SHELTER_NAMES[tier];
+          if (tier >= 3) {
+            return "Tap / E: Enter Wooden Hut (🔥 Fireplace inside)";
+          }
           return up && this.hasCost(up.cost) ? `Tap: build ${up.name.toLowerCase()} · Hold: go inside` : `Hold: go inside your ${name.toLowerCase()}`;
         })(),
       };
       hint = map[best.kind] || "";
     } else if (this.has("spear") && this.animalNear) hint = this.equipped === "spear" ? "Walk slowly toward it to aim" : "Equip your spear (Q)";
     else if (!this.has("water") && (this.inventory.snow || 0) < 2 && (JOURNEY[this.journeyIndex]?.id === "water" || (this.has("barkPot") && this.thirst < 45))) hint = "Scoop snow ❄️";
+    
+    if (this.sitting) {
+      hint = "E — Stand";
+    }
+
     this.onUpdate({
       health: this.health, temp: this.temp, hunger: this.hunger, thirst: this.thirst, stamina: this.stamina,
       inventory: inv, time: this.time, day: this.day, score: Math.floor(this.score),
@@ -1566,6 +2553,21 @@ export class Game {
       })(),
       fireLighting: this.fireLighting, resting: this.resting, restProgress: this.restProgress,
       shelterTier: this.currentShelterTier(), tracking: this.tracking, carrying: this.carrying,
+      activeStorageId: this.activeStorageId,
+      campTotals: this.getCampTotals(),
+      fireplaceFuel: (() => {
+        const hut = this.hutShelter();
+        return hut ? (hut.fireplaceFuel !== undefined ? hut.fireplaceFuel : 80) : -1;
+      })(),
+      fireplaceHeat: this.fireplaceHeatLevel(),
+      sitting: this.sitting,
+      activeDogId: this.activeDogId,
+      dogHunger: (() => { const d = this.dog(); return d ? Math.round(d.dogHunger ?? 80) : -1; })(),
+      dogState: (() => { const d = this.dog(); return d ? d.dogState || "follow" : ""; })(),
+      dogWaiting: (() => { const d = this.dog(); return d ? !!d.dogWait : false; })(),
+      stormExposure: this.stormExposure,
+      survivalWarning: this.survivalWarning,
+      criticalExposure: this.criticalColdTimer < 45 && this.isStormActive() && !this.interiorActive() && !this.nearFire(),
     });
   }
 }

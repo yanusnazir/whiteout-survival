@@ -78,7 +78,12 @@ export type EntityKind =
   | "trap"
   | "trackRabbit"
   | "trackDeer"
-  | "snowPile";
+  | "snowPile"
+  | "woodStorage"
+  | "foodStorage"
+  | "waterStorage"
+  | "materialStorage"
+  | "dog";
 
 export interface Entity {
   id: number;
@@ -110,6 +115,16 @@ export interface Entity {
   slots?: number[];    // drying rack: drying progress (0..1) of each hanging strip
   carcassOf?: "rabbit" | "deer" | "wolf";
   angle?: number;
+  storage?: Partial<Record<ItemId, number>>;
+  foodTimestamps?: Partial<Record<ItemId, number[]>>;
+  capacity?: number;
+  fireplaceFuel?: number; // Fuel for the fireplace in wooden hut (tier 3 shelter)
+  dogHunger?: number; // 0..100 (100 = full)
+  dogState?: "follow" | "idle" | "rest" | "eat" | "pet" | "sit" | "run" | "walk";
+  dogStateTimer?: number;
+  dogTailWag?: number;
+  dogAnim?: number;
+  dogWait?: boolean;
 }
 
 export interface HighScore {
